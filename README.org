@@ -1,0 +1,6 @@
+* Toy SQLx
+
+Not a clone of SQLx
+
+Read this [[file:inside-sqlx-how-rust-checks-sql-before-your-application-runs.org][Inside SQLx: How Rust Checks SQL Before Your Application Runs]]
+

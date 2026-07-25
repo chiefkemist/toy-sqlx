@@ -1,0 +1,1744 @@
+
+#+title: Inside SQLx — building compile-time checked SQL from Lego bricks
+#+author: ChiefKemist
+#+date: <2026-07-25 Sat>
+
+
+* Introduction
+
+We are building a toy `SQLx` to understand some of its main features and how they could be constructed. We will at the same time explore some `Rust` + ecosystem features such as `macros` and `Cargo` workspaces. The ultimate goal is to understand when it comes to `Rust` and `SQL` where compile-time query guarantees actually come from.
+
+We start with SQL that Rust treats as an unchecked string, and we finish with this:
+
+#+begin_src rust :tangle no
+let users = toy_sqlx::query!(
+    &connection,
+    "SELECT id, email FROM users WHERE active = ?1",
+    true,
+)?;
+#+end_src
+
+where once macro call will make three systems contribute to correctness:
+
+- *SQLite* proves that the SQL is valid for the build schema.
+- *The macro* turns SQLite's evidence into Rust code.
+- *rustc* checks the generated fields and application structs.
+
+We will not clone `SQLx`, instead we are exposing the smallest useful compile-time pipeline to enforce correct `SQL` in `Rust` code.
+
+* About Macros
+
+ #+begin_quote
+ “The whole language there all the time. There is no real distinction between read-time, compile-time, and runtime. You can compile or run code while reading, read or run code while compiling, and read or compile code at runtime.
+
+ Running code at read-time lets users reprogram Lisp's syntax; running code at compile-time is the basis of macros; compiling at runtime is the basis of Lisp's use as an extension language in programs like Emacs; and reading at runtime enables programs to communicate using s-expressions, an idea recently reinvented as XML.”
+ #+end_quote
+
+ — Paul Graham, /Revenge of the Nerds/, in /Hackers & Painters/,
+ section “What Made Lisp Different,” item 9.
+
+ Reference: [[https://paulgraham.com/icad.html][Paul Graham — Revenge of the Nerds]]
+
+* Scaffolding: three crates
+
+Cargo workspace crates: `toy-sqlx`, `toy-macro`, `toy-demo`
+
+#+name: toy-sqlx/Cargo.toml
+#+begin_src toml :tangle toy-sqlx/Cargo.toml :mkdirp yes :comments no
+[package]
+name = "toy-sqlx"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+toy-sqlx-macros = { path = "../toy-sqlx-macros" }
+rusqlite = { version = "0.39", features = ["bundled"] }
+#+end_src
+
+#+name: toy-macro/Cargo.toml
+#+begin_src toml :tangle toy-sqlx-macros/Cargo.toml :mkdirp yes :comments no
+[package]
+name = "toy-sqlx-macros"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+rusqlite = { version = "0.39", features = ["bundled", "column_metadata"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+syn = { version = "2", features = ["full"] }
+#+end_src
+
+#+name: toy-demo/Cargo.toml
+#+begin_src toml :tangle toy-demo/Cargo.toml :mkdirp yes :comments no
+[package]
+name = "toy-demo"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+fail-literal = []
+fail-invalid-sql = []
+fail-arity = []
+fail-query-as-name = []
+fail-query-as-type = []
+fail-expression-metadata = []
+fail-unsupported-shape = []
+fail-view-source = []
+fail-subquery-source = []
+
+[dependencies]
+toy-sqlx = { path = "../toy-sqlx" }
+#+end_src
+
+
+* Step 0: expose the runtime failure
+:PROPERTIES:
+:MINUTES: 5
+:END:
+
+#+begin_quote
+*Problem:* Rust sees SQL as ordinary text, so it cannot reject a bad column.
+
+*Why care:* the first useful feedback arrives only after the program is built,
+deployed, and the query path runs.
+
+*This step:* create one tiny database and deliberately prepare an invalid query at
+runtime.  This is the baseline every later step must improve.
+#+end_quote
+
+The fixture has only the schema evidence we will need later: declared column
+types and one nullable column.  The setup program uses no checked macro.
+
+#+name: fixture-schema
+#+begin_src sql :tangle toy-demo/schema.sql :mkdirp yes :comments no
+PRAGMA foreign_keys = ON;
+
+DROP VIEW IF EXISTS hidden_join;
+DROP TABLE IF EXISTS users;
+
+CREATE TABLE users (
+    id           INTEGER PRIMARY KEY NOT NULL,
+    email        TEXT NOT NULL UNIQUE,
+    display_name TEXT,
+    active       BOOLEAN NOT NULL DEFAULT TRUE CHECK (active IN (FALSE, TRUE))
+);
+
+INSERT INTO users (email, display_name, active) VALUES
+    ('ada@example.test',   'Ada', TRUE),
+    ('grace@example.test', NULL,  TRUE),
+    ('alan@example.test',  'Alan', FALSE);
+#+end_src
+
+#+name: fixture-setup
+#+begin_src rust :tangle toy-demo/src/bin/setup.rs :mkdirp yes :comments no
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let url = std::env::var("TOY_DATABASE_URL").expect("TOY_DATABASE_URL is required");
+    let connection = toy_sqlx::connect(&url)?;
+    connection.execute_batch(include_str!("../../schema.sql"))?;
+    println!("initialized {}", toy_sqlx::database_path(&url).display());
+    Ok(())
+}
+#+end_src
+
+#+name: runtime-failure
+#+begin_src rust :tangle toy-demo/src/bin/00_runtime_sql.rs :mkdirp yes :comments no
+fn main() -> Result<(), toy_sqlx::rusqlite::Error> {
+    let url = std::env::var("TOY_DATABASE_URL").expect("TOY_DATABASE_URL is required");
+    let connection = toy_sqlx::connect(&url)?;
+    let result = connection.prepare("SELECT id, definitely_missing FROM users");
+    match result {
+        Ok(_) => println!("unexpected success"),
+        Err(error) => println!("runtime SQLite error: {error}"),
+    }
+    Ok(())
+}
+#+end_src
+
+
+- *Run the step:*
+
+#+begin_src bash :results output
+
+  ./scripts/toy-demo.sh 0
+
+#+end_src
+
+#+RESULTS:
+:     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s
+:      Running `target/debug/00_runtime_sql`
+: runtime SQLite error: no such column: definitely_missing in SELECT id, definitely_missing FROM users at offset 11
+
+- *Observe:* Rust compiles; SQLite reports =definitely_missing= at runtime.
+- *We gained:* a concrete failure to move earlier.
+- *Still broken:* the compiler never receives SQL as inspectable input.  Step 1
+  gives the SQL to a procedural macro.
+  
+
+* Step 1: make the SQL visible at compile time
+:PROPERTIES:
+:MINUTES: 6
+:END:
+
+#+begin_quote
+*Problem:* a procedural macro receives Rust tokens, not the value hidden inside a
+runtime variable.
+
+*Why care:* compile-time checking is impossible unless the SQL itself is available
+during macro expansion.
+
+*This step:* require a string literal.  The first macro only parses and returns the
+literal, so we can see this boundary without mixing in database logic.
+#+end_quote
+
+The runtime crate below is supporting plumbing: connect to SQLite and map rows.
+It performs no compile-time analysis.
+
+#+name: toy-runtime
+#+begin_src rust :tangle toy-sqlx/src/lib.rs :mkdirp yes :comments no
+use std::path::Path;
+
+pub use rusqlite;
+pub use toy_sqlx_macros::{checked_query, checked_sql, query, query_as, sql_literal};
+
+pub fn database_path(url: &str) -> &Path {
+    let path = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+        .unwrap_or(url);
+    Path::new(path)
+}
+
+pub fn connect(url: &str) -> rusqlite::Result<rusqlite::Connection> {
+    let connection = rusqlite::Connection::open(database_path(url))?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(connection)
+}
+
+#[doc(hidden)]
+pub fn map_rows<T, F>(
+    connection: &rusqlite::Connection,
+    sql: &str,
+    parameters: &[&dyn rusqlite::ToSql],
+    mut map: F,
+) -> rusqlite::Result<Vec<T>>
+where
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+{
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement.query_map(parameters, |row| map(row))?;
+    rows.collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_urls_and_paths() {
+        assert_eq!(database_path("sqlite://db/toy.db"), Path::new("db/toy.db"));
+        assert_eq!(database_path("sqlite::memory:"), Path::new(":memory:"));
+        assert_eq!(database_path("db/toy.db"), Path::new("db/toy.db"));
+    }
+
+    #[test]
+    fn enables_foreign_keys() {
+        let connection = connect("sqlite::memory:").unwrap();
+        let enabled: bool = connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert!(enabled);
+    }
+}
+#+end_src
+
+#+name: macro-foundation
+#+begin_src rust :tangle toy-sqlx-macros/src/lib.rs :mkdirp yes :comments no
+//! A deliberately small, SQLite-only model of SQLx's compile-time query macros.
+//!
+//! # The central idea
+//!
+//! A procedural macro runs while the crate that called it is being compiled.  It
+//! receives Rust *tokens*, asks SQLite what a SQL string means, and emits new Rust
+//! tokens.  The emitted Rust then goes through the normal Rust compiler.
+//!
+//! The pipeline is:
+//!
+//! 1. [`syn`] parses the macro input into Rust data structures.
+//! 2. [`rusqlite`] prepares the SQL and returns parameter/column metadata.
+//! 3. This crate validates the deliberately small teaching subset.
+//! 4. [`quote!`] builds ordinary Rust code from that metadata.
+//! 5. `rustc` checks the generated fields, types, and struct literals.
+//!
+//! This is teaching code, not a general SQL analyzer.  Typed queries intentionally
+//! accept only direct columns from one real SQLite table.
+
+// Standard-library tools used for names, environment variables, cache files, and paths.
+use std::{collections::HashSet, env, fs, path::PathBuf};
+
+// `proc_macro::TokenStream` is the compiler-facing input and output type.
+use proc_macro::TokenStream;
+// `proc_macro2` provides token types that are easier to build and test.
+use proc_macro2::{Ident, Span, TokenStream as Tokens};
+// `quote!` turns Rust-like syntax into tokens; `format_ident!` creates identifiers.
+use quote::{format_ident, quote};
+// SQLite is both the runtime database and our compile-time SQL authority.
+use rusqlite::{Connection, OpenFlags};
+// Descriptions are serialized so the same evidence can be used offline.
+use serde::{Deserialize, Serialize};
+// `syn` parses literals, expressions, types, commas, and custom macro grammars.
+#[rustfmt::skip]
+use syn::{parse::{Parse, ParseStream}, parse_macro_input, punctuated::Punctuated, Expr, LitStr, Token, Type};
+#+end_src
+
+#+name: macro-entry-points
+#+begin_src rust :tangle toy-sqlx-macros/src/lib.rs :mkdirp yes :comments no
+/// Require the macro input to be a string literal, then emit that literal unchanged.
+///
+/// This first teaching macro does not understand SQL.  Its only job is to show
+/// that compile-time checking needs compile-time input: `sql_literal!(variable)`
+/// fails because `variable` is not a [`LitStr`].
+#[proc_macro]
+pub fn sql_literal(input: TokenStream) -> TokenStream {
+    // `parse_macro_input!` stops expansion and emits a compiler diagnostic on failure.
+    let sql = parse_macro_input!(input as LitStr);
+    // `#sql` interpolates the parsed literal into the token stream built by `quote!`.
+    quote!(#sql).into()
+}
+
+/// Convert our internal `syn::Result` into the token stream required by rustc.
+///
+/// Procedural macros cannot return `Result`.  A `syn::Error` therefore becomes a
+/// `compile_error!` invocation placed at the most useful source span.
+fn result(result: syn::Result<Tokens>) -> TokenStream {
+    result.unwrap_or_else(syn::Error::into_compile_error).into()
+}
+#+end_src
+
+#+name: literal-demo
+#+begin_src rust :tangle toy-demo/src/bin/01_literal_macro.rs :mkdirp yes :comments no
+fn main() {
+    #[cfg(feature = "fail-literal")]
+    {
+        let sql = "SELECT 40 + 2";
+        let _ = toy_sqlx::sql_literal!(sql);
+    }
+    #[cfg(not(feature = "fail-literal"))]
+    println!("{}", toy_sqlx::sql_literal!("SELECT 40 + 2 AS answer"));
+}
+#+end_src
+
+
+Use =cargo expand= to prove that the macro emits the literal unchanged.  The first
+command confirms that =cargo-expand= is installed.  If it is missing, run
+=cargo install cargo-expand --locked= once.
+
+#+begin_src bash :results output
+
+  set -euo pipefail
+  cargo expand --version
+  cargo expand --color never -p toy-demo --bin 01_literal_macro 2>/dev/null |
+    grep -C 2 'SELECT 40 + 2 AS answer'
+
+#+end_src
+
+#+RESULTS:
+: cargo-expand-expand 1.0.59 + prettyplease 0.2.10
+: fn main() {
+:     {
+:         ::std::io::_print(format_args!("{0}\n", "SELECT 40 + 2 AS answer"));
+:     };
+: }
+
+The useful expansion is intentionally boring:
+
+#+begin_src rust :tangle no
+"SELECT 40 + 2 AS answer"
+#+end_src
+
+- *Run the step and its expected failure:*
+
+#+begin_src bash :results output
+
+  ./scripts/toy-demo.sh 1
+  ./scripts/toy-demo.sh fail-literal
+
+#+end_src
+
+#+RESULTS:
+:    Compiling toy-demo v0.1.0 (/Users/chiefkemist/Documents/native_workspace/mini-sqlx-workshop/toy-demo)
+:     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+:      Running `target/debug/01_literal_macro`
+: SELECT 40 + 2 AS answer
+: fail-literal: failed as intended
+
+- *Observe:* a literal compiles; a runtime =String= is rejected by the macro parser.
+- *We gained:* the macro owns the SQL text during compilation.
+- *Still broken:* owning text does not prove valid SQL.  Step 2 asks the system
+  that actually understands SQLite.
+
+
+* Step 2: let SQLite reject bad SQL during compilation
+:PROPERTIES:
+:MINUTES: 12
+:END:
+
+#+begin_quote
+*Problem:* the macro can now see the SQL, but it still cannot tell whether a table
+or column exists.
+
+*Why care:* writing a second SQLite parser inside the macro would be large,
+incomplete, and less trustworthy than SQLite itself.
+
+*This step:* during macro expansion, open the build database read-only and ask
+SQLite to prepare the query.  Convert SQLite's answer into a small =Description=
+that later steps can reuse.
+#+end_quote
+
+There are only three moving pieces: the description, the macro entry point, and
+the online loader.  In this step, watch the call to =connection.prepare=.  The
+other description fields become useful in Steps 3, 4, and 6.
+
+#+name: description-ir
+#+begin_src rust :tangle toy-sqlx-macros/src/lib.rs :mkdirp yes :comments no
+// Bump this whenever the meaning or shape of cached metadata changes.  Old cache
+// entries then fail clearly instead of being interpreted under new rules.
+const CACHE_VERSION: u8 = 3;
+
+/// The small intermediate representation shared by online and offline checking.
+///
+/// Think of `Description` as a fact sheet about one SQL string:
+///
+/// - `parameter_count` says how many values SQLite expects;
+/// - `columns` describes the result set;
+/// - `source_is_table` records whether our narrow typed-query rule was proved;
+/// - `version`, `database`, and `sql` protect offline cache loading.
+///
+/// Keeping one representation is important: code generation does not need to know
+/// whether these facts came from live SQLite or from a cache file.
+#[rustfmt::skip]
+#[derive(Debug, Serialize, Deserialize)]
+struct Description { version: u8, database: String, sql: String, parameter_count: usize, source_is_table: bool, columns: Vec<Column> }
+
+/// The SQLite evidence needed to generate one Rust output field.
+///
+/// `declared_type` is the type written in `CREATE TABLE`; it is not the type of
+/// every value SQLite could dynamically store.  `nullable` decides between `T`
+/// and `Option<T>` in generated Rust.
+#[rustfmt::skip]
+#[derive(Debug, Serialize, Deserialize)]
+struct Column { name: String, declared_type: Option<String>, nullable: bool }
+#+end_src
+
+#+name: checked-sql-entry
+#+begin_src rust :tangle toy-sqlx-macros/src/lib.rs :mkdirp yes :comments no
+/// Ask SQLite to validate a SQL literal during macro expansion.
+///
+/// The emitted value is still just the original string literal.  The improvement
+/// is timing: invalid SQL becomes a compiler error instead of a runtime error.
+#[proc_macro]
+pub fn checked_sql(input: TokenStream) -> TokenStream {
+    let sql = parse_macro_input!(input as LitStr);
+    // Loading the description performs validation; this macro discards the facts.
+    result(load_description(&sql).map(|_| quote!(#sql)))
+}
+#+end_src
+
+#+name: online-description
+#+begin_src rust :tangle toy-sqlx-macros/src/lib.rs :mkdirp yes :comments no
+/// Obtain query evidence from exactly one source.
+///
+/// Offline mode reads a previously saved description.  Online mode asks SQLite
+/// directly and optionally saves the answer for a later offline build.
+fn load_description(sql: &LitStr) -> syn::Result<Description> {
+    if flag("TOY_SQLX_OFFLINE") {
+        return load_cache(&sql.value(), sql.span());
+    }
+    let description = describe_online(&sql.value(), sql.span())?;
+    if flag("TOY_SQLX_PREPARE") {
+        save_cache(&description, sql.span())?;
+    }
+    Ok(description)
+}
+
+/// Recognize the deliberately tiny SQL shape supported by typed queries.
+///
+/// This is a *scope guard*, not a SQL parser.  It returns a table name only for a
+/// projection of direct columns from one simple table.  Any uncertainty returns
+/// `None`, which makes the typed macro reject the query rather than invent facts.
+#[rustfmt::skip]
+fn direct_source(sql: &str) -> Option<&str> {
+    // Comments could hide extra `FROM` clauses, so this toy rejects them outright.
+    if ["--", "/*", "*/"].iter().any(|marker| sql.contains(marker)) { return None; }
+    // Whitespace tokenization is enough because every accepted shape is simple.
+    let words = sql.split_whitespace().collect::<Vec<_>>();
+    // Exactly one FROM excludes ordinary SELECT subqueries and ambiguous sources.
+    let from = words.iter().enumerate().filter(|(_, word)| word.eq_ignore_ascii_case("FROM")).map(|(index, _)| index).collect::<Vec<_>>();
+    let [from] = from.as_slice() else { return None };
+    // The first word after FROM must be an unquoted, unqualified table identifier.
+    let table = *words.get(from + 1)?;
+    // Stop the source clause when ordinary filtering/ordering begins.
+    let tail = words[from + 2..].iter().take_while(|word| !matches!(word.to_ascii_uppercase().as_str(), "WHERE" | "GROUP" | "ORDER" | "LIMIT")).copied().collect::<Vec<_>>();
+    let ident = |word: &str| word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    // Every selected field must be `column`, `table.column`, or either form with `AS name`.
+    let fields = words[1..*from].join(" ");
+    let direct_field = |field: &str| { let parts = field.split_whitespace().collect::<Vec<_>>(); let path = parts.first()?.split('.').collect::<Vec<_>>(); Some((path.len() == 1 || path.len() == 2) && path.iter().all(|part| ident(part)) && (parts.len() == 1 || (parts.len() == 3 && parts[1].eq_ignore_ascii_case("AS") && ident(parts[2])))) };
+    // After the table, allow no alias, `alias`, or `AS alias`—never a second source.
+    let alias = tail.is_empty() || (tail.len() == 1 && ident(tail[0])) || (tail.len() == 2 && tail[0].eq_ignore_ascii_case("AS") && ident(tail[1]));
+    (ident(table) && alias && fields.split(',').all(|field| direct_field(field) == Some(true))).then_some(table)
+}
+
+/// Ask a live SQLite database to describe a query during compilation.
+///
+/// Preparing validates syntax, table names, and column names without executing the
+/// query.  `span` points diagnostics back at the SQL literal in the caller's code.
+#[rustfmt::skip]
+fn describe_online(sql: &str, span: Span) -> syn::Result<Description> {
+    // Cargo runs this function inside the proc-macro process, not in the final program.
+    let url = env::var("TOY_DATABASE_URL")
+        .map_err(|_| syn::Error::new(span, "TOY_DATABASE_URL is required for online checking"))?;
+    // Accept the same small set of SQLite URL forms as the runtime crate.
+    let path = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+        .unwrap_or(&url);
+    // Read-only mode prevents a compile from modifying the teaching database.
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| syn::Error::new(span, format!("cannot open SQLite: {error}")))?;
+    // This is the key compile-time check: let SQLite validate SQLite SQL.
+    let statement = connection.prepare(sql).map_err(|error| {
+        syn::Error::new(
+            span,
+            format!("SQLite rejected this query during compilation: {error}"),
+        )
+    })?;
+    // Copy only the output facts needed by later Rust code generation.
+    let columns = (0..statement.column_count())
+        .map(|index| {
+            let name = statement.column_name(index)?.to_owned();
+            let metadata = statement.column_metadata(index)?;
+            // rusqlite exposes several origin fields; this toy needs declaration and NOT NULL.
+            let (declared_type, nullable) = match metadata {
+                Some((_, _, _, declared, _, not_null, _, _)) => (
+                    declared.map(|value| value.to_string_lossy().into_owned()),
+                    !not_null,
+                ),
+                // Missing origin evidence must never be treated as non-null.
+                None => (None, true),
+            };
+            Ok(Column { name, declared_type, nullable })
+        })
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| syn::Error::new(span, format!("cannot describe output: {error}")))?;
+    // Lexical recognition is not enough: sqlite_schema must confirm a real table, not a view.
+    #[rustfmt::skip]
+    let source_is_table = direct_source(sql).is_some_and(|table| connection.query_row(
+        "SELECT type = 'table' FROM sqlite_schema WHERE name = ?1", [table], |row| row.get(0),
+    ).unwrap_or(false));
+    // The prepared statement itself supplies SQLite's authoritative placeholder count.
+    Ok(Description {
+        version: CACHE_VERSION,
+        database: "SQLite".into(),
+        sql: sql.into(),
+        parameter_count: statement.parameter_count(),
+        source_is_table,
+        columns,
+    })
+}
+#+end_src
+
+#+name: prepare-demo
+#+begin_src rust :tangle toy-demo/src/bin/02_compile_time_prepare.rs :mkdirp yes :comments no
+fn main() {
+    #[cfg(feature = "fail-invalid-sql")]
+    let sql = toy_sqlx::checked_sql!("SELECT id, definitely_missing FROM users");
+    #[cfg(not(feature = "fail-invalid-sql"))]
+    let sql = toy_sqlx::checked_sql!("SELECT id, email FROM users");
+    println!("SQLite accepted during compilation: {sql}");
+}
+#+end_src
+
+
+- *Run the step and its expected failure:*
+
+#+begin_src bash :results output
+
+  ./scripts/toy-demo.sh 2
+  ./scripts/toy-demo.sh fail-sql
+
+#+end_src
+
+#+RESULTS:
+:    Compiling toy-demo v0.1.0 (/Users/chiefkemist/Documents/native_workspace/mini-sqlx-workshop/toy-demo)
+:     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.20s
+:      Running `target/debug/02_compile_time_prepare`
+: SQLite accepted during compilation: SELECT id, email FROM users
+: fail-sql: failed as intended
+
+- *Observe:* =definitely_missing= is now a compiler error.
+- *We gained:* SQLite accepted the query against the build database.
+- *Boundary:* the runtime database can still have a different schema.
+- *Still broken:* valid SQL may receive the wrong number of Rust values.  Step 3
+  checks placeholders against arguments.
+
+
+* Step 3: reject the wrong number of arguments
+:PROPERTIES:
+:MINUTES: 8
+:END:
+
+#+begin_quote
+*Problem:* a query can be valid while its =?1=, =?2= placeholders do not match the
+number of values supplied by Rust.
+
+*Why care:* that mismatch otherwise becomes another runtime prepare/bind failure.
+
+*This step:* compare SQLite's parameter count with the number of macro arguments.
+Keep the Rust expressions visible to rustc without evaluating them.
+#+end_quote
+
+This is deliberately *arity-only*.  SQLite does not provide static bind types.
+
+#+name: checked-input
+#+begin_src rust :tangle toy-sqlx-macros/src/lib.rs :mkdirp yes :comments no
+/// Parsed input for `checked_query!("SQL", arg1, arg2, ...)`.
+///
+/// `Punctuated` is syn's representation of zero or more expressions separated by
+/// commas.  Keeping expressions as syntax lets us count them without running them.
+#[rustfmt::skip]
+struct CheckedInput { sql: LitStr, args: Punctuated<Expr, Token![,]> }
+
+/// Teach syn the little grammar accepted by `checked_query!`.
+impl Parse for CheckedInput {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        // The first token must be the SQL string literal.
+        let sql = input.parse()?;
+        let args = if input.is_empty() {
+            // A query without placeholders needs no comma and no arguments.
+            Punctuated::new()
+        } else {
+            // Otherwise consume the comma after SQL, then all comma-separated expressions.
+            input.parse::<Token![,]>()?;
+            Punctuated::parse_terminated(input)?
+        };
+        Ok(Self { sql, args })
+    }
+}
+#+end_src
+
+#+name: checked-query-entry
+#+begin_src rust :tangle toy-sqlx-macros/src/lib.rs :mkdirp yes :comments no
+/// Validate SQL plus parameter arity, but do not execute the query.
+///
+/// This transitional macro isolates one lesson: SQLite can tell us how many
+/// parameters it expects, but not static SQLite parameter types.
+#[proc_macro]
+pub fn checked_query(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as CheckedInput);
+    result(expand_checked(input))
+}
+#+end_src
+
+#+name: checked-query-expansion
+#+begin_src rust :tangle toy-sqlx-macros/src/lib.rs :mkdirp yes :comments no
+/// Implement `checked_query!` after its tokens have been parsed.
+fn expand_checked(input: CheckedInput) -> syn::Result<Tokens> {
+    let description = load_description(&input.sql)?;
+    validate_arity(input.args.len(), &description, input.sql.span())?;
+    let CheckedInput { sql, args } = input;
+    let args = args.into_iter().collect::<Vec<_>>();
+    Ok(quote! {{
+        // This branch never runs, but rustc still resolves and type-checks each expression.
+        // `#(...)*` is quote's repetition syntax: emit the body once per argument.
+        if false {
+            #(let _ = &(#args);)*
+        }
+        // The macro's runtime value remains the original SQL string.
+        #sql
+    }})
+}
+#+end_src
+
+Expand the demo to see the unevaluated argument retained inside =if false=:
+
+#+begin_src bash :results output
+
+  set -euo pipefail
+  ./scripts/toy-demo.sh setup >/dev/null
+  export TOY_DATABASE_URL="sqlite://$(pwd)/toy-demo/toy.db"
+  cargo expand --color never -p toy-demo --bin 03_parameter_arity 2>/dev/null |
+    grep -A 4 'if false'
+
+#+end_src
+
+#+name: arity-demo
+#+begin_src rust :tangle toy-demo/src/bin/03_parameter_arity.rs :mkdirp yes :comments no
+fn main() {
+    let deliberately_wrong_type = "SQLite accepts dynamic values";
+    #[cfg(feature = "fail-arity")]
+    let sql = toy_sqlx::checked_query!(
+        "SELECT id FROM users WHERE active = ?1 AND id >= ?2",
+        deliberately_wrong_type,
+    );
+    #[cfg(not(feature = "fail-arity"))]
+    let sql = toy_sqlx::checked_query!(
+        "SELECT id FROM users WHERE active = ?1",
+        deliberately_wrong_type,
+    );
+    println!("arity checked, parameter type deliberately unchecked: {sql}");
+}
+#+end_src
+
+
+- *Run the step and its expected failure:*
+
+#+begin_src bash :results output
+
+  ./scripts/toy-demo.sh 3
+  ./scripts/toy-demo.sh fail-arity
+
+#+end_src
+
+#+RESULTS:
+:    Compiling toy-demo v0.1.0 (/Users/chiefkemist/Documents/native_workspace/mini-sqlx-workshop/toy-demo)
+:     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.22s
+:      Running `target/debug/03_parameter_arity`
+: arity checked, parameter type deliberately unchecked: SELECT id FROM users WHERE active = ?1
+: fail-arity: failed as intended
+
+- *Observe:* one value for two placeholders fails; one value for one placeholder
+  passes—even when that value is deliberately an inappropriate string.
+- *We gained:* the bind count matches.
+- *Boundary:* no static SQLite bind-type claim is made.
+- *Still broken:* successful queries still return untyped rows.  Step 4 generates
+  the Rust output shape and decoder.
+
+
+* Step 4: generate a typed record and decoder
+:PROPERTIES:
+:MINUTES: 17
+:END:
+
+#+begin_quote
+*Problem:* even checked SQL still requires repetitive =row.get(0)=,
+=row.get(1)= calls and handwritten Rust types.
+
+*Why care:* positional decoding is brittle, and the SQL result shape is duplicated
+in Rust by hand.
+
+*This step:* turn column names and declared types in =Description= into a local
+=Record=, then generate the positional decoder that constructs it.
+#+end_quote
+
+The declared-type mapping is intentionally visible and tiny:
+
+| SQLite declaration contains | Generated Rust base type |
+|---+---|
+| =BOOL= or =BOOLEAN= | =bool= |
+| =INT= | =i64= |
+| =REAL=, =FLOA=, or =DOUB= | =f64= |
+| =CHAR=, =CLOB=, or =TEXT= | =String= |
+| =BLOB= | =Vec<u8>= |
+| anything else | compile-time error |
+
+Step 6 explains when a base type stays =T= and when nullability wraps it in
+=Option<T>=.
+
+#+name: query-input
+#+begin_src rust :tangle toy-sqlx-macros/src/lib.rs :mkdirp yes :comments no
+/// Parsed input for `query!(&connection, "SQL", arg1, arg2, ...)`.
+///
+/// The connection and every argument are full Rust expressions.  They are kept as
+/// syntax until expansion emits code that evaluates each exactly once.
+#[rustfmt::skip]
+struct QueryInput { connection: Expr, sql: LitStr, args: Punctuated<Expr, Token![,]> }
+
+/// Parse the connection first, then reuse `CheckedInput` for SQL and arguments.
+#[rustfmt::skip]
+impl Parse for QueryInput {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let connection = input.parse()?; input.parse::<Token![,]>()?;
+        let checked = input.parse::<CheckedInput>()?;
+        Ok(Self { connection, sql: checked.sql, args: checked.args })
+    }
+}
+#+end_src
+
+#+name: query-entry
+#+begin_src rust :tangle toy-sqlx-macros/src/lib.rs :mkdirp yes :comments no
+/// Validate and execute a query whose output record is generated by the macro.
+///
+/// The local generated type has one Rust field per selected SQL column.
+#[proc_macro]
+pub fn query(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as QueryInput);
+    result(expand_query(input, Output::Generated))
+}
+#+end_src
+
+#+name: typed-query-expansion
+#+begin_src rust :tangle toy-sqlx-macros/src/lib.rs :mkdirp yes :comments no
+/// Choose which Rust value the row decoder constructs.
+enum Output {
+    /// `query!` asks us to define a local `Record` type.
+    Generated,
+    /// `query_as!` gives us an application-owned type to construct.
+    Given(Box<Type>),
+}
+
+/// A checked SQL output column translated into a Rust field name and type tokens.
+#[rustfmt::skip]
+struct RustColumn { ident: Ident, ty: Tokens }
+
+/// Build the Rust program emitted by `query!` and `query_as!`.
+///
+/// Everything before the final `quote!` runs during compilation.  The code inside
+/// that `quote!` is what the caller's program will execute at runtime.
+#[rustfmt::skip]
+fn expand_query(input: QueryInput, output: Output) -> syn::Result<Tokens> {
+    // Compile-time phase: gather evidence and reject unsupported input.
+    let description = load_description(&input.sql)?;
+    validate_arity(input.args.len(), &description, input.sql.span())?;
+    let columns = typed_columns(&description, input.sql.span())?;
+
+    // Turn each checked column into `field_name: RustType` tokens.
+    let fields = columns.iter().map(|column| {
+        let ident = &column.ident;
+        let ty = &column.ty;
+        quote!(#ident: #ty)
+    });
+    // Turn each checked column into `field_name: row.get::<_, RustType>(index)?`.
+    let values: Vec<_> = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let ident = &column.ident;
+            let ty = &column.ty;
+            quote!(#ident: __toy_row.get::<usize, #ty>(#index)?)
+        })
+        .collect();
+
+    // Both public macros share one decoder; only their final constructor differs.
+    let (definition, expression) = match output {
+        Output::Generated => (
+            quote!(#[derive(Debug)] struct Record { #(#fields),* }),
+            quote!(Record { #(#values),* }),
+        ),
+        Output::Given(output) => (Tokens::new(), quote!(#output { #(#values),* })),
+    };
+
+    let QueryInput { connection, sql, args } = input;
+    // Generated local names let us evaluate every caller expression exactly once.
+    let names: Vec<_> = (0..args.len())
+        .map(|index| format_ident!("__toy_arg_{index}"))
+        .collect();
+    let args = args.into_iter().collect::<Vec<_>>();
+
+    // Runtime phase: this entire block is inserted at the macro call site.
+    Ok(quote! {{
+        #definition
+        // Tuple right-hand sides are evaluated before the generated names are bound.
+        let (__toy_connection, #(#names,)*) = (#connection, #(&(#args),)*);
+        // rusqlite accepts a slice of references to values implementing `ToSql`.
+        let __toy_parameters: &[&dyn ::toy_sqlx::rusqlite::ToSql] = &[#(#names),*];
+        ::toy_sqlx::map_rows(
+            __toy_connection,
+            #sql,
+            __toy_parameters,
+            // Decode one SQLite row into the generated or caller-provided struct.
+            |__toy_row| ::core::result::Result::Ok(#expression),
+        )
+    }})
+}
+
+/// Compare the number of Rust arguments with SQLite's placeholder count.
+///
+/// This intentionally checks only *how many* values exist.  SQLite does not give
+/// this toy stable static parameter types, so claiming more would be misleading.
+fn validate_arity(got: usize, description: &Description, span: Span) -> syn::Result<()> {
+    if got == description.parameter_count {
+        Ok(())
+    } else {
+        let expected = description.parameter_count;
+        Err(syn::Error::new(
+            span,
+            format!("SQLite expects {expected} parameter(s), but the macro received {got}"),
+        ))
+    }
+}
+
+/// Turn SQLite columns into safe Rust field names and types.
+///
+/// The function first enforces the evidence boundary, then checks names, rejects
+/// duplicate fields, maps SQLite declarations, and applies nullability.
+fn typed_columns(description: &Description, span: Span) -> syn::Result<Vec<RustColumn>> {
+    ensure_typed_shape(&description.sql, span)?;
+    if !description.source_is_table {
+        return Err(syn::Error::new(
+            span,
+            "typed query must select direct columns from one table; expressions, views, and subqueries are out of scope",
+        ));
+    }
+    if description.columns.is_empty() {
+        return Err(syn::Error::new(span, "typed query must return columns"));
+    }
+    let mut names = HashSet::new();
+    description
+        .columns
+        .iter()
+        .map(|column| {
+            // A SQL output name must be usable in a generated Rust struct literal.
+            let ident = rust_ident(&column.name, span)?;
+            if !names.insert(ident.to_string()) {
+                return Err(syn::Error::new(span, "duplicate output field name"));
+            }
+            // Expressions often have no table declaration; typed output rejects them.
+            let declared = column.declared_type.as_deref().ok_or_else(|| {
+                let name = &column.name;
+                syn::Error::new(span, format!("SQLite has no declared type for {name:?}; typed queries only support direct table columns"))
+            })?;
+            let base = rust_type(declared, span)?;
+            // Rust represents a possibly-NULL SQL value as `Option<T>`.
+            let ty = if column.nullable {
+                quote!(::core::option::Option<#base>)
+            } else {
+                base
+            };
+            Ok(RustColumn { ident, ty })
+        })
+        .collect()
+}
+
+/// Reject broad SQL shapes before generating typed Rust.
+///
+/// Joins and compound queries need nullability analysis that this workshop does
+/// not implement.  Conservative rejection keeps the small guarantee honest.
+fn ensure_typed_shape(sql: &str, span: Span) -> syn::Result<()> {
+    let sql = sql.trim_start().to_ascii_uppercase();
+    let words =
+        || sql.split(|character: char| !character.is_ascii_alphanumeric() && character != '_');
+    let unsupported = !sql.starts_with("SELECT ")
+        || words().filter(|word| *word == "SELECT").count() != 1
+        || words().any(|word| matches!(word, "JOIN" | "UNION" | "INTERSECT" | "EXCEPT"));
+    if unsupported {
+        Err(syn::Error::new(
+            span,
+            "typed queries support one direct-table SELECT; joins and compound queries are out of scope",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Convert a SQLite output name into a Rust field identifier.
+///
+/// The raw form (`r#type`, for example) allows Rust keywords when legal.  The
+/// fallback handles ordinary identifiers on compiler versions with differing
+/// raw-identifier parsing behavior.
+fn rust_ident(name: &str, span: Span) -> syn::Result<Ident> {
+    syn::parse_str(&format!("r#{name}"))
+        .or_else(|_| syn::parse_str(name))
+        .map_err(|_| syn::Error::new(span, format!("{name:?} is not a Rust field name")))
+}
+
+/// Map a small set of SQLite declared types to Rust type tokens.
+///
+/// SQLite uses type affinity and permits dynamic stored values.  This table is a
+/// teaching subset, not a claim that every stored value must have this Rust type.
+///
+/// | Declaration contains | Generated base type |
+/// | --- | --- |
+/// | `BOOL` or `BOOLEAN` | `bool` |
+/// | `INT` | `i64` |
+/// | `REAL`, `FLOA`, or `DOUB` | `f64` |
+/// | `CHAR`, `CLOB`, or `TEXT` | `String` |
+/// | `BLOB` | `Vec<u8>` |
+/// | anything else | compiler error |
+fn rust_type(declared: &str, span: Span) -> syn::Result<Tokens> {
+    let name = declared.trim().to_ascii_uppercase();
+    if matches!(name.as_str(), "BOOL" | "BOOLEAN") {
+        Ok(quote!(bool))
+    } else if name.contains("INT") {
+        Ok(quote!(i64))
+    } else if name.contains("REAL") || name.contains("FLOA") || name.contains("DOUB") {
+        Ok(quote!(f64))
+    } else if name.contains("CHAR") || name.contains("CLOB") || name.contains("TEXT") {
+        Ok(quote!(::std::string::String))
+    } else if name.contains("BLOB") {
+        Ok(quote!(::std::vec::Vec<u8>))
+    } else {
+        Err(syn::Error::new(
+            span,
+            format!("no toy Rust mapping for SQLite declaration {declared:?}"),
+        ))
+    }
+}
+#+end_src
+
+#+name: typed-record-demo
+#+begin_src rust :tangle toy-demo/src/bin/04_typed_record.rs :mkdirp yes :comments no
+fn main() -> Result<(), toy_sqlx::rusqlite::Error> {
+    let url = std::env::var("TOY_DATABASE_URL").expect("TOY_DATABASE_URL is required");
+    let connection = toy_sqlx::connect(&url)?;
+    let users = toy_sqlx::query!(
+        &connection,
+        "SELECT id, email, display_name FROM users WHERE active = ?1 ORDER BY id",
+        true,
+    )?;
+    for user in users {
+        println!("{} {} {:?}", user.id, user.email, user.display_name);
+    }
+    Ok(())
+}
+#+end_src
+
+
+Expand the demo and select the generated =Record= plus runtime row-mapping call:
+
+#+begin_src bash :results output
+
+  set -euo pipefail
+  ./scripts/toy-demo.sh setup >/dev/null
+  export TOY_DATABASE_URL="sqlite://$(pwd)/toy-demo/toy.db"
+  cargo expand --color never -p toy-demo --bin 04_typed_record 2>/dev/null |
+    grep -E -A 12 'struct Record|::toy_sqlx::map_rows'
+
+#+end_src
+
+The important generated shape is:
+
+#+begin_src rust :tangle no
+struct Record {
+    id: i64,
+    email: String,
+    display_name: Option<String>,
+}
+map_rows(connection, sql, parameters, |row| Ok(Record {
+    id: row.get::<usize, i64>(0)?,
+    email: row.get::<usize, String>(1)?,
+    display_name: row.get::<usize, Option<String>>(2)?,
+}))
+#+end_src
+
+- *Run the step:*
+
+#+begin_src bash :results output
+
+  ./scripts/toy-demo.sh 4
+
+#+end_src
+
+#+RESULTS:
+:    Compiling toy-demo v0.1.0 (/Users/chiefkemist/Documents/native_workspace/mini-sqlx-workshop/toy-demo)
+:     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.24s
+:      Running `target/debug/04_typed_record`
+: 1 ada@example.test Some("Ada")
+: 2 grace@example.test None
+
+- *Observe:* the loop uses =user.id= and =user.email=; no handwritten =row.get=
+  calls remain in application code.
+- *We gained:* output names and supported declarations become Rust fields.
+- *Question parked for Step 6:* what evidence justifies =String= for =email= but
+  =Option<String>= for =display_name=?
+- *Still broken next:* =Record= is local to the macro expansion.  Step 5 maps the
+  same evidence into an application-owned struct.
+
+
+* Step 5: populate an application-owned struct
+:PROPERTIES:
+:MINUTES: 10
+:END:
+
+#+begin_quote
+*Problem:* the generated local =Record= is convenient inside one expression, but
+applications already have named domain types used across functions and modules.
+
+*Why care:* query results should fit those types without adding a second manual
+decoder.
+
+*This step:* generate an ordinary literal of the caller's struct.  Let rustc—not
+the macro—verify the field names and Rust types.
+#+end_quote
+
+=query_as!= reuses the same expansion and changes only the final constructor.  It
+does not inspect or reflect over the struct definition.
+
+#+name: query-as-input
+#+begin_src rust :tangle toy-sqlx-macros/src/lib.rs :mkdirp yes :comments no
+/// Parsed input for `query_as!(OutputType, &connection, "SQL", args...)`.
+#[rustfmt::skip]
+struct QueryAsInput { output: Type, query: QueryInput }
+
+/// Parse the caller's Rust type, then reuse the complete `query!` grammar.
+#[rustfmt::skip]
+impl Parse for QueryAsInput {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let output = input.parse()?; input.parse::<Token![,]>()?;
+        Ok(Self { output, query: input.parse()? })
+    }
+}
+#+end_src
+
+#+name: query-as-entry
+#+begin_src rust :tangle toy-sqlx-macros/src/lib.rs :mkdirp yes :comments no
+/// Validate and execute a query into a caller-provided Rust struct.
+///
+/// The macro emits an ordinary struct literal.  rustc therefore reports missing,
+/// extra, or incorrectly typed fields without custom reflection machinery.
+#[proc_macro]
+#[rustfmt::skip]
+pub fn query_as(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as QueryAsInput);
+    result(expand_query(input.query, Output::Given(Box::new(input.output))))
+}
+#+end_src
+
+#+name: query-as-demo
+#+begin_src rust :tangle toy-demo/src/bin/05_query_as.rs :mkdirp yes :comments no
+struct UserSummary {
+    id: i64,
+    email: String,
+}
+
+#[cfg(feature = "fail-query-as-name")]
+struct WrongName {
+    id: i64,
+    address: String,
+}
+
+#[cfg(feature = "fail-query-as-type")]
+struct WrongType {
+    id: i32,
+    email: String,
+}
+
+fn main() -> Result<(), toy_sqlx::rusqlite::Error> {
+    let url = std::env::var("TOY_DATABASE_URL").expect("TOY_DATABASE_URL is required");
+    let connection = toy_sqlx::connect(&url)?;
+    #[cfg(feature = "fail-query-as-name")]
+    let _ = toy_sqlx::query_as!(
+        WrongName,
+        &connection,
+        "SELECT id, email FROM users ORDER BY id"
+    )?;
+    #[cfg(feature = "fail-query-as-type")]
+    let _ = toy_sqlx::query_as!(
+        WrongType,
+        &connection,
+        "SELECT id, email FROM users ORDER BY id"
+    )?;
+    #[cfg(not(any(feature = "fail-query-as-name", feature = "fail-query-as-type")))]
+    for user in toy_sqlx::query_as!(
+        UserSummary,
+        &connection,
+        "SELECT id, email FROM users ORDER BY id"
+    )? {
+        println!("{} {}", user.id, user.email);
+    }
+    Ok(())
+}
+#+end_src
+
+
+Expand =query_as!= to see that it reuses =map_rows= but constructs
+=UserSummary= instead of defining =Record=:
+
+#+begin_src bash :results output
+
+  set -euo pipefail
+  ./scripts/toy-demo.sh setup >/dev/null
+  export TOY_DATABASE_URL="sqlite://$(pwd)/toy-demo/toy.db"
+  cargo expand --color never -p toy-demo --bin 05_query_as 2>/dev/null |
+    grep -A 12 '::toy_sqlx::map_rows'
+
+#+end_src
+
+The generated expression is an ordinary struct literal:
+
+#+begin_src rust :tangle no
+UserSummary {
+    id: row.get::<usize, i64>(0)?,
+    email: row.get::<usize, String>(1)?,
+}
+#+end_src
+
+- *Run the step and both expected failures:*
+
+#+begin_src bash :results output
+
+  ./scripts/toy-demo.sh 5
+  ./scripts/toy-demo.sh fail-query-as-name
+  ./scripts/toy-demo.sh fail-query-as-type
+
+#+end_src
+
+#+RESULTS:
+:    Compiling toy-demo v0.1.0 (/Users/chiefkemist/Documents/native_workspace/mini-sqlx-workshop/toy-demo)
+:     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.39s
+:      Running `target/debug/05_query_as`
+: 1 ada@example.test
+: 2 grace@example.test
+: 3 alan@example.test
+: fail-query-as-name: failed as intended
+: fail-query-as-type: failed as intended
+
+- *Observe:* correct =UserSummary= compiles; a wrong field or field type produces
+  an ordinary rustc error.
+- *We gained:* checked rows can enter application-owned types with no second
+  decoding system.
+- *Still broken:* generated Rust is only trustworthy if the SQL metadata justifies
+  it.  Step 6 defines the honest evidence boundary.
+
+
+* Step 6: make the type claim honest
+:PROPERTIES:
+:MINUTES: 8
+:END:
+
+#+begin_quote
+*Problem:* generating =String= for a value that can actually be =NULL= makes a
+compile-time feature confidently wrong.
+
+*Why care:* joins, views, subqueries, and expressions can change nullability even
+when an underlying table column says =NOT NULL=.
+
+*This step:* accept typed output only for direct columns from one real table.  Read
+that table's schema: =NOT NULL= becomes =T=; everything nullable becomes
+=Option<T>=.  Reject shapes whose evidence we cannot justify.
+#+end_quote
+
+This is not a small SQL parser pretending to understand every query.  Rejection is
+the correctness mechanism.
+
+#+name: nullability-demo
+#+begin_src rust :tangle toy-demo/src/bin/06_nullability.rs :mkdirp yes :comments no
+fn main() -> Result<(), toy_sqlx::rusqlite::Error> {
+    let url = std::env::var("TOY_DATABASE_URL").expect("TOY_DATABASE_URL is required");
+    let connection = toy_sqlx::connect(&url)?;
+    #[cfg(feature = "fail-expression-metadata")]
+    let _ = toy_sqlx::query!(&connection, "SELECT COUNT(*) AS user_count FROM users")?;
+    #[cfg(feature = "fail-unsupported-shape")]
+    let _ = toy_sqlx::query!(
+        &connection,
+        "SELECT a.id FROM users AS a JOIN users AS b ON a.id = b.id",
+    )?;
+    #[cfg(feature = "fail-view-source")]
+    let _ = toy_sqlx::query!(&connection, "SELECT bid FROM hidden_join")?;
+    #[cfg(feature = "fail-subquery-source")]
+    let _ = toy_sqlx::query!(
+        &connection,
+        "SELECT (VALUES(NULL),(email)) AS email FROM users"
+    )?;
+    #[cfg(not(any(
+        feature = "fail-expression-metadata",
+        feature = "fail-unsupported-shape",
+        feature = "fail-view-source",
+        feature = "fail-subquery-source"
+    )))]
+    for user in toy_sqlx::query!(
+        &connection,
+        "SELECT email, display_name FROM users ORDER BY id"
+    )? {
+        println!("{} {:?}", user.email, user.display_name);
+    }
+    Ok(())
+}
+#+end_src
+
+
+- *Run the step and its evidence-boundary failures:*
+
+#+begin_src bash :results output
+
+  ./scripts/toy-demo.sh 6
+  ./scripts/toy-demo.sh fail-expression
+  ./scripts/toy-demo.sh fail-shape
+  ./scripts/toy-demo.sh fail-view
+  ./scripts/toy-demo.sh fail-subquery
+
+#+end_src
+
+#+RESULTS:
+#+begin_example
+   Compiling toy-demo v0.1.0 (/Users/chiefkemist/Documents/native_workspace/mini-sqlx-workshop/toy-demo)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.30s
+     Running `target/debug/06_nullability`
+ada@example.test Some("Ada")
+grace@example.test None
+alan@example.test Some("Alan")
+fail-expression: failed as intended
+fail-shape: failed as intended
+fail-view: failed as intended
+fail-subquery: failed as intended
+#+end_example
+
+- *Observe:* direct =email= is =String=; nullable =display_name= is
+  =Option<String>=; unsupported shapes fail during compilation.
+- *We gained:* a narrow typed-query claim backed by direct schema evidence.
+- *Still broken:* online expansion needs the database every time.  Step 7 makes
+  the evidence portable.
+
+
+* Step 7: compile without the build database
+:PROPERTIES:
+:MINUTES: 7
+:END:
+
+#+begin_quote
+*Problem:* compile-time checking now depends on opening the build database.
+
+*Why care:* developers and CI may need reproducible builds where that database is
+unavailable.
+
+*This step:* save the already-validated =Description= as JSON, then load that same
+shape in offline mode.  Keep every validation and code-generation step after the
+loader unchanged.
+#+end_quote
+
+The cache is deliberately visible: a small hash chooses the filename, while
+version, backend, and exact SQL are checked before cached evidence is trusted.
+
+#+name: offline-cache
+#+begin_src rust :tangle toy-sqlx-macros/src/lib.rs :mkdirp yes :comments no
+/// Read the workshop's Boolean environment flags.
+fn flag(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE"))
+}
+
+/// Produce a short, deterministic cache filename from the exact SQL text.
+///
+/// FNV-1a is used because its loop is easy to teach.  A production cache would
+/// normally use a collision-resistant hash and stronger concurrency guarantees.
+fn hash(sql: &str) -> u64 {
+    sql.as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+}
+
+/// Locate this query's cache file inside the crate that invoked the macro.
+///
+/// `CARGO_MANIFEST_DIR` belongs to the caller, so each crate gets its own
+/// `.toy-sqlx` directory rather than sharing the proc-macro crate's directory.
+fn cache_path(sql: &str, span: Span) -> syn::Result<PathBuf> {
+    let manifest = env::var_os("CARGO_MANIFEST_DIR")
+        .ok_or_else(|| syn::Error::new(span, "Cargo did not provide CARGO_MANIFEST_DIR"))?;
+    Ok(PathBuf::from(manifest)
+        .join(".toy-sqlx")
+        .join(format!("query-{:016x}.json", hash(sql))))
+}
+
+/// Serialize a live SQLite description as readable JSON for offline compilation.
+fn save_cache(description: &Description, span: Span) -> syn::Result<()> {
+    let path = cache_path(&description.sql, span)?;
+    fs::create_dir_all(path.parent().unwrap())
+        .and_then(|_| fs::write(&path, serde_json::to_vec_pretty(description).unwrap()))
+        .map_err(|error| syn::Error::new(span, format!("cannot write {}: {error}", path.display())))
+}
+
+/// Load cached evidence and reject anything that does not match this query.
+///
+/// Checking version, backend, and exact SQL prevents a cache entry created under
+/// different assumptions from silently driving Rust code generation.
+fn load_cache(sql: &str, span: Span) -> syn::Result<Description> {
+    let path = cache_path(sql, span)?;
+    let bytes = fs::read(&path).map_err(|error| {
+        syn::Error::new(
+            span,
+            format!("offline metadata missing at {}: {error}", path.display()),
+        )
+    })?;
+    let description: Description = serde_json::from_slice(&bytes)
+        .map_err(|error| syn::Error::new(span, format!("invalid offline metadata: {error}")))?;
+    // All three checks are part of the cache's trust boundary.
+    if description.version != CACHE_VERSION
+        || description.database != "SQLite"
+        || description.sql != sql
+    {
+        Err(syn::Error::new(
+            span,
+            "offline metadata does not match this SQLite query",
+        ))
+    } else {
+        Ok(description)
+    }
+}
+#+end_src
+
+- *Run the online demo, then prove the offline build:*
+
+#+begin_src bash :results output
+
+  ./scripts/toy-demo.sh 7
+  ./scripts/toy-demo.sh offline
+
+#+end_src
+
+#+RESULTS:
+:    Compiling toy-demo v0.1.0 (/Users/chiefkemist/Documents/native_workspace/mini-sqlx-workshop/toy-demo)
+:     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.39s
+:      Running `target/debug/07_offline_metadata`
+: decoded 3 users using a compile-time description
+: offline: success plus missing, malformed, version, backend, and SQL mismatch checks passed
+
+- *Observe:* prepare metadata online, remove the database, force expansion, and
+  compile successfully from the cache.
+- *We gained:* code generation consumes one =Description= regardless of whether
+  its evidence came from live SQLite or a checked cache.
+- *Boundary:* cache freshness, collision resistance, atomic writes, and concurrent
+  writers are production concerns.  The toy verifies missing, malformed,
+  wrong-version, wrong-backend, and wrong-SQL metadata.
+
+** Tangled verification and presentation runner                         :noexport:
+
+The core story ends above.  The remaining blocks automate tests, demonstrations,
+expected failures, and size checks; they are not additional teaching steps.
+
+#+name: focused-macro-tests
+#+begin_src rust :tangle toy-sqlx-macros/src/lib.rs :mkdirp yes :comments no
+// These tests target the small policies that are easiest to break while editing
+// the workshop: type mapping, query-shape rejection, field names, and cache hashes.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[rustfmt::skip]
+    fn maps_the_teaching_types() {
+        // Compare emitted tokens as text because these helpers generate code, not values.
+        assert_eq!(rust_type("INTEGER", Span::call_site()).unwrap().to_string(), "i64");
+        assert_eq!(
+            rust_type("TEXT", Span::call_site()).unwrap().to_string(),
+            ":: std :: string :: String"
+        );
+        assert!(rust_type("NUMERIC", Span::call_site()).is_err());
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn rejects_unsupported_sources_and_shapes() {
+        // Every uncertain shape must fail closed rather than generate an unsound type.
+        assert!(ensure_typed_shape("SELECT * FROM a LEFT JOIN b", Span::call_site()).is_err());
+        assert!(ensure_typed_shape("DELETE FROM a RETURNING id", Span::call_site()).is_err());
+        assert!(ensure_typed_shape("SELECT (SELECT id FROM a) FROM b", Span::call_site()).is_err());
+        assert_eq!(direct_source("SELECT id FROM users"), Some("users"));
+        assert_eq!(direct_source("SELECT id FROM users AS u WHERE u.id > 0"), Some("users"));
+        assert_eq!(direct_source("SELECT bid /* FROM users */ FROM hidden_join"), None);
+        assert_eq!(direct_source("SELECT u.id FROM users u , hidden_join v"), None);
+        assert_eq!(direct_source("SELECT (VALUES(NULL),(email)) AS email FROM users"), None);
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn rejects_bad_and_duplicate_fields() {
+        // Invalid or repeated SQL names cannot form a valid Rust struct.
+        assert!(rust_ident("bad name", Span::call_site()).is_err());
+        let column = || Column { name: "id".into(), declared_type: Some("INTEGER".into()), nullable: false };
+        let description = Description { version: CACHE_VERSION, database: "SQLite".into(), sql: "SELECT id, id FROM users".into(), parameter_count: 0, source_is_table: true, columns: vec![column(), column()] };
+        assert!(typed_columns(&description, Span::call_site()).is_err());
+    }
+
+    #[test]
+    fn hash_is_stable() {
+        // Changing this value would move every cache file and requires an explicit decision.
+        assert_eq!(hash("SELECT 1"), 0x199e7bca63ea84f2);
+    }
+}
+#+end_src
+
+#+name: offline-demo
+#+begin_src rust :tangle toy-demo/src/bin/07_offline_metadata.rs :mkdirp yes :comments no
+fn main() -> Result<(), toy_sqlx::rusqlite::Error> {
+    let url = std::env::var("TOY_DATABASE_URL").expect("TOY_DATABASE_URL is required");
+    let connection = toy_sqlx::connect(&url)?;
+    let users = toy_sqlx::query!(&connection, "SELECT id, email FROM users ORDER BY id")?;
+    println!(
+        "decoded {} users using a compile-time description",
+        users.len()
+    );
+    Ok(())
+}
+#+end_src
+
+#+name: presentation-runner
+#+begin_src bash :tangle scripts/toy-demo.sh :mkdirp yes :comments no :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+export TOY_DATABASE_URL="${TOY_DATABASE_URL:-sqlite://$root/toy-demo/toy.db}"
+
+database_path() {
+  case "$1" in
+    sqlite://*) printf '%s\n' "${1#sqlite://}" ;;
+    sqlite:*) printf '%s\n' "${1#sqlite:}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+setup() {
+  cargo run --quiet -p toy-demo --bin setup
+}
+
+run_stage() {
+  local bin="0${1}_$2" pattern="$3" output
+  setup >/dev/null
+  output="$(cargo run -p toy-demo --bin "$bin" 2>&1)"
+  printf '%s\n' "$output"
+  grep -Eq "$pattern" <<<"$output"
+}
+
+expect_failure() {
+  local label="$1" bin="$2" feature="$3" pattern="$4" setup_first="${5:-yes}" log
+  [[ "$setup_first" == yes ]] && setup >/dev/null
+  log="$(mktemp)"
+  if cargo check -p toy-demo --bin "$bin" --features "$feature" >"$log" 2>&1; then
+    cat "$log"
+    rm -f "$log"
+    echo "$label unexpectedly compiled" >&2
+    return 1
+  fi
+  if ! grep -Eq "$pattern" "$log"; then
+    cat "$log"
+    rm -f "$log"
+    echo "$label failed without the expected diagnostic" >&2
+    return 1
+  fi
+  rm -f "$log"
+  echo "$label: failed as intended"
+}
+
+create_hidden_view() {
+  local database
+  database="$(database_path "$TOY_DATABASE_URL")"
+  python3 - "$database" <<'PY'
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("CREATE VIEW hidden_join AS SELECT b.id AS bid FROM users a LEFT JOIN users b ON b.id = -1")
+connection.commit()
+PY
+}
+
+offline_failure() {
+  local pattern="$1" log
+  log="$(mktemp)"
+  cargo clean -p toy-demo >/dev/null
+  if TOY_SQLX_OFFLINE=1 cargo check -p toy-demo --bin 07_offline_metadata >"$log" 2>&1; then
+    cat "$log"
+    rm -f "$log"
+    echo "invalid offline metadata unexpectedly compiled" >&2
+    return 1
+  fi
+  grep -Eq "$pattern" "$log" || { cat "$log"; rm -f "$log"; return 1; }
+  rm -f "$log"
+}
+
+offline() {
+  local database backup cache saved
+  setup >/dev/null
+  rm -rf toy-demo/.toy-sqlx
+  cargo clean -p toy-demo >/dev/null
+  TOY_SQLX_PREPARE=1 cargo check -p toy-demo --bin 07_offline_metadata
+  database="$(database_path "$TOY_DATABASE_URL")"
+  backup="${database}.offline-backup"
+  cache="$(find toy-demo/.toy-sqlx -name 'query-*.json' -print -quit)"
+  saved="${cache}.saved"
+  cp "$cache" "$saved"
+  cleanup() {
+    [[ -e "$backup" ]] && mv "$backup" "$database"
+    [[ -e "$saved" ]] && mv -f "$saved" "$cache"
+  }
+  trap cleanup EXIT
+  rm -f "$backup"
+  mv "$database" "$backup"
+  cargo clean -p toy-demo >/dev/null
+  TOY_SQLX_OFFLINE=1 cargo check -p toy-demo --bin 07_offline_metadata
+
+  rm "$cache"
+  offline_failure 'offline metadata missing'
+  cp "$saved" "$cache"
+  printf '{' >"$cache"
+  offline_failure 'invalid offline metadata'
+  for field in version database sql; do
+    cp "$saved" "$cache"
+    python3 - "$cache" "$field" <<'PY'
+import json, sys
+path, field = sys.argv[1:]
+data = json.load(open(path))
+if field == "version": data[field] += 1
+else: data[field] += "-wrong"
+open(path, "w").write(json.dumps(data))
+PY
+    offline_failure 'offline metadata does not match'
+  done
+
+  cleanup
+  trap - EXIT
+  echo "offline: success plus missing, malformed, version, backend, and SQL mismatch checks passed"
+}
+
+size() {
+  local macro_prod macro_tests runtime demos total
+  read -r macro_prod macro_tests < <(awk '
+    BEGIN { test = 0; production = 0; tests = 0 }
+    /^#\[cfg\(test\)\]/ { test = 1 }
+    /^[[:space:]]*$/ || /^[[:space:]]*\/\// { next }
+    { if (test) tests++; else production++ }
+    END { print production, tests }
+  ' toy-sqlx-macros/src/lib.rs)
+  runtime="$(awk '!/^[[:space:]]*$/ && !/^[[:space:]]*\/\//' toy-sqlx/src/lib.rs | wc -l | tr -d ' ')"
+  demos="$(awk '!/^[[:space:]]*$/ && !/^[[:space:]]*\/\//' toy-demo/src/bin/*.rs | wc -l | tr -d ' ')"
+  total=$((macro_prod + macro_tests + runtime + demos))
+  printf 'macro production=%s tests=%s runtime=%s demos=%s total=%s\n' \
+    "$macro_prod" "$macro_tests" "$runtime" "$demos" "$total"
+  ((macro_prod <= 340 && macro_tests <= 50 && runtime <= 80 && demos <= 180 && total <= 650))
+}
+
+workspace() {
+  setup >/dev/null
+  scripts/setup-db.sh >/dev/null
+  cargo test --workspace
+  cargo clippy -p toy-sqlx -p toy-sqlx-macros -p toy-demo --all-targets -- -D warnings
+  cargo +1.85.0 check -p toy-sqlx -p toy-sqlx-macros -p toy-demo
+  cargo fmt --all -- --check
+}
+
+all() {
+  "$0" 0
+  "$0" 1
+  "$0" 2
+  "$0" 3
+  "$0" 4
+  "$0" 5
+  "$0" 6
+  "$0" 7
+  "$0" fail-literal
+  "$0" fail-sql
+  "$0" fail-arity
+  "$0" fail-query-as-name
+  "$0" fail-query-as-type
+  "$0" fail-expression
+  "$0" fail-shape
+  "$0" fail-view
+  "$0" fail-subquery
+  "$0" offline
+  "$0" size
+}
+
+case "${1:-}" in
+  setup) setup ;;
+  0) run_stage 0 runtime_sql 'runtime SQLite error' ;;
+  1) run_stage 1 literal_macro 'SELECT 40 \+ 2 AS answer' ;;
+  2) run_stage 2 compile_time_prepare 'SQLite accepted during compilation' ;;
+  3) run_stage 3 parameter_arity 'parameter type deliberately unchecked' ;;
+  4) run_stage 4 typed_record 'grace@example\.test None' ;;
+  5) run_stage 5 query_as 'alan@example\.test' ;;
+  6) run_stage 6 nullability 'grace@example\.test None' ;;
+  7) run_stage 7 offline_metadata 'decoded 3 users using a compile-time description' ;;
+  fail-literal) expect_failure "$1" 01_literal_macro fail-literal 'expected string literal' ;;
+  fail-sql) expect_failure "$1" 02_compile_time_prepare fail-invalid-sql 'SQLite rejected this query' ;;
+  fail-arity) expect_failure "$1" 03_parameter_arity fail-arity 'SQLite expects 2 parameter.*received 1' ;;
+  fail-query-as-name) expect_failure "$1" 05_query_as fail-query-as-name 'has no field named.*email' ;;
+  fail-query-as-type) expect_failure "$1" 05_query_as fail-query-as-type 'incompatible types|mismatched types' ;;
+  fail-expression) expect_failure "$1" 06_nullability fail-expression-metadata 'direct columns from one table' ;;
+  fail-shape) expect_failure "$1" 06_nullability fail-unsupported-shape 'joins and compound queries are out of scope' ;;
+  fail-view)
+    setup >/dev/null
+    create_hidden_view
+    expect_failure "$1" 06_nullability fail-view-source 'direct columns from one table' no
+    ;;
+  fail-subquery) expect_failure "$1" 06_nullability fail-subquery-source 'direct columns from one table' ;;
+  offline) offline ;;
+  size) size ;;
+  workspace) workspace ;;
+  all) all ;;
+  *)
+    echo "usage: scripts/toy-demo.sh {setup|0|1|2|3|4|5|6|7|offline|fail-*|all|workspace|size}" >&2
+    exit 2
+    ;;
+esac
+#+end_src
+
+
+* Recap: assemble the pipeline
+
+The progression was a chain of earlier feedback:
+
+#+begin_example
+runtime SQL error
+  -> compile-time literal
+  -> SQLite validation
+  -> arity validation
+  -> generated record
+  -> application struct
+  -> evidence-backed nullability
+  -> offline compilation
+#+end_example
+
+Nothing here required the macro to become a database.  The macro only transports
+evidence from SQLite into Rust code that rustc already knows how to check.
+
+| Final claim | Evidence used | Honest boundary |
+|---+---+---|
+| SQL is valid | SQLite prepared it during expansion | only the build schema |
+| Bind count matches | SQLite parameter count | no SQLite bind types |
+| Output fields exist | statement column metadata | direct columns only |
+| Rust output shape matches | generated record/struct literal | dynamic values may decode badly |
+| Nullable direct column | schema =NOT NULL= metadata | joins/expressions rejected |
+| DB-free build | cached =Description= | cache freshness is external discipline |
+
+The reusable engineering model is: *ask the database, preserve its evidence,
+generate ordinary Rust, and let rustc finish the check*.
+
+* Q&A
+
+Core content stops here by minute 80.  The next sections are not required for the
+main story.
+
+* Appendix
+
+** Backend-dependent parameter typing
+PostgreSQL-like backends can return parameter type metadata and generate dead-code
+Rust type assertions.  SQLite returns arity only.  Adding a made-up SQLite parser
+to the core would obscure this boundary.
+
+** Expression overrides
+A larger toy can parse aliases such as ="count!: INTEGER"=.  The core rejects
+expressions so every inferred type has direct metadata.
+
+** Join-aware nullability
+Real systems may inspect plans or SQLite bytecode.  The advanced legacy
+=mini-sqlx-macros= demonstrates why this rapidly expands the implementation.
+
+** Stronger caches
+Discuss cryptographic hashes, schema identity, atomic writes, locks, and CI cache
+freshness without tangling them into the teaching implementation.
+
+** Async runtimes and pools
+They change execution, not the compile-time evidence/code-generation pipeline.
+
+** Migrations and CI
+The macro checks the schema present during the build.  CI should create an
+isolated DB, apply migrations, compile/prepare queries, and verify cached evidence.
+
+** Mapping the toy to SQLx
+The toy =Description= corresponds to a backend describe result; =load_description=
+corresponds to online/offline query data selection; =expand_query= corresponds to
+argument/output code generation.  The names are conceptual, not source-fidelity
+claims.
+
