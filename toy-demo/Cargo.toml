@@ -1,0 +1,20 @@
+[package]
+name = "toy-demo"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+fail-literal = []
+fail-invalid-sql = []
+fail-arity = []
+fail-query-as-name = []
+fail-query-as-type = []
+fail-expression-metadata = []
+fail-unsupported-shape = []
+fail-view-source = []
+fail-subquery-source = []
+
+[dependencies]
+toy-sqlx = { path = "../toy-sqlx" }

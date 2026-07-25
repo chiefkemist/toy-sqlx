@@ -1,0 +1,10 @@
+[package]
+name = "toy-sqlx"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+toy-sqlx-macros = { path = "../toy-sqlx-macros" }
+rusqlite = { version = "0.39", features = ["bundled"] }

@@ -1,0 +1,8 @@
+target
+.DS_Store
+.idea/
+.mini-sqlx/
+.toy-sqlx/
+*.db
+*.db-*
+*.offline-backup
